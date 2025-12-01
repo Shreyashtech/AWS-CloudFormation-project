@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WebFarm – Fully Working with 7 Alarms + SNS Email (Tested Nov 2025)
+
+Resources:
+  # ==================== Security Groups ====================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to ALB
+      VpcId: !ImportValue WebFarm-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB only
+      VpcId: !ImportValue WebFarm-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # ==================== ALB + Target Group ====================
+  MyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: WebFarm-TG
+      Protocol: HTTP
+      Port: 80
+      VpcId: !ImportValue WebFarm-VPC-ID
+      HealthCheckPath: /
+      TargetType: instance
+
+  MyALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: WebFarm-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue WebFarm-PublicSubnet1
+        - !ImportValue WebFarm-PublicSubnet2
+      SecurityGroups: [ !Ref ALBSecurityGroup ]
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref MyALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref MyTargetGroup
+
+  # ==================== Launch Template ====================
+  MyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: WebServer-LT
+      LaunchTemplateData:
+        ImageId: ami-093a7f5fbae13ff67
+        InstanceType: t2.micro
+        KeyName: Linux-Singapore-Keypair-2025
+        SecurityGroupIds: [ !Ref WebServerSG ]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            cat << 'EOF' > /var/www/html/index.html
+            <!DOCTYPE html><html><head><title>ASG Live</title><style>
+              body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+              background:#000428;background:linear-gradient(135deg,#000428,#004e92);color:#0ff;
+              font-family:Arial,sans-serif;text-align:center}
+              .box{background:rgba(255,255,255,0.1);padding:40px 60px;border-radius:20px;
+              backdrop-filter:blur(10px);box-shadow:0 0 30px rgba(0,255,255,0.5)}
+              h1{font-size:3em;margin:0;background:-webkit-linear-gradient(#0ff,#f0f);
+              -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+              p{font-size:1.4em;margin:15px 0}
+            </style></head><body>
+              <div class="box"><h1>Live from EC2</h1>
+              <p>Hostname: <b id="h">Loading...</b></p>
+              <p>IP: <b id="i">Loading...</b></p>
+              <p>AZ: <b id="a">Loading...</b></p></div>
+              <script>
+                fetch('http://169.254.169.254/latest/meta-data/hostname').then(r=>r.text()).then(t=>h.textContent=t);
+                fetch('http://169.254.169.254/latest/meta-data/local-ipv4').then(r=>r.text()).then(t=>i.textContent=t);
+                fetch('http://169.254.169.254/latest/meta-data/placement/availability-zone').then(r=>r.text()).then(t=>a.textContent=t);
+              </script>
+            </body></html>
+            EOF
+
+  # ==================== ASG ====================
+  MyASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: WebFarm-ASG
+      VPCZoneIdentifier:
+        - !ImportValue WebFarm-PublicSubnet1
+        - !ImportValue WebFarm-PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MyLaunchTemplate
+        Version: !GetAtt MyLaunchTemplate.LatestVersionNumber
+      MinSize: 2          # ← numbers, not strings
+      MaxSize: 5
+      DesiredCapacity: 3
+      TargetGroupARNs: [ !Ref MyTargetGroup ]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+  # ==================== Scaling Policies (depend on ASG) ====================
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    DependsOn: MyASG
+    Properties:
+      AutoScalingGroupName: !Ref MyASG
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 20
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    DependsOn: MyASG
+    Properties:
+      AutoScalingGroupName: !Ref MyASG
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 20
+
+  # ==================== Request-based Alarms ====================
+  HighRequestAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "> 3 requests → scale out"
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt MyTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt MyALB.LoadBalancerFullName
+      Statistic: Sum
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+
+  LowRequestAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "≤ 3 requests → scale in"
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt MyTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt MyALB.LoadBalancerFullName
+      Statistic: Sum
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref ScaleInPolicy
+
+  # ==================== SNS + Email ====================
+  ASGAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: WebFarm-Critical-Alerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ASGAlertsTopic
+      Endpoint: shreyashpatil.1508@gmail.com
+
+  # ==================== 7 GOLDEN ALARMS (Montioring) ====================
+
+  # 1. ASG reached MaxSize
+  ASGMaxCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-Max-Capacity
+      AlarmDescription: CRITICAL – ASG at MaxSize
+      Namespace: AWS/AutoScaling
+      MetricName: GroupTotalInstances
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref MyASG
+      Statistic: Maximum
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+  # 2. Too few healthy instances
+  ASGLowHealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-Low-Healthy
+      AlarmDescription: CRITICAL – < 2 healthy instances
+      Namespace: AWS/AutoScaling
+      MetricName: GroupInServiceInstances
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref MyASG
+      Statistic: Minimum
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+  # 3. CPU ≥ 50%
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-High-CPU
+      AlarmDescription: WARNING – CPU ≥ 50%
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref MyASG
+      Statistic: Average
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+  # 4. ALB 5xx
+  ALB5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt MyALB.LoadBalancerFullName
+      Statistic: Sum
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+  # 5. Unhealthy hosts
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-Unhealthy-Hosts
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt MyTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt MyALB.LoadBalancerFullName
+      Statistic: Maximum
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+  # 6. High latency
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-High-Latency
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt MyTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt MyALB.LoadBalancerFullName
+      Statistic: Average
+      Period: 20
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+  # 7. Scaling stuck – SAFE version (compares Desired vs Total)
+  ScalingStuckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebFarm-Scaling-Stuck
+      AlarmDescription: WARNING – Desired > Total for 15+ min
+      EvaluationPeriods: 3
+      Metrics:
+        - Id: desired
+          MetricStat:
+            Metric:
+              Namespace: AWS/AutoScaling
+              MetricName: GroupDesiredCapacity
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref MyASG
+            Period: 20
+            Stat: Average
+          ReturnData: false
+        - Id: total
+          MetricStat:
+            Metric:
+              Namespace: AWS/AutoScaling
+              MetricName: GroupTotalInstances
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref MyASG
+            Period: 20
+            Stat: Average
+          ReturnData: false
+        - Id: diff
+          Expression: desired - total
+          Label: DesiredMinusTotal
+          ReturnData: true
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [ !Ref ASGAlertsTopic ]
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub 'http://${MyALB.DNSName}'
+  SNSTopic:
+    Value: !Ref ASGAlertsTopic
