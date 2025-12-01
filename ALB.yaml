@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Application Load Balancer for your 4 sampleEC2 instances
+
+Resources:
+  WebALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: sampleEC2-ALB
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+       - Fn::ImportValue: WebFarm-PublicSubnet1
+       - Fn::ImportValue: WebFarm-PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: sampleEC2-ALB
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to ALB
+      VpcId:      
+       Fn::ImportValue: WebFarm-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-SG
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: sampleEC2-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId:       
+        Fn::ImportValue: WebFarm-VPC-ID
+      TargetType: instance
+      HealthCheckPath: /
+      HealthyThresholdCount: 2
+      Targets:
+        - Id: !ImportValue WebFarm-Instance1
+          Port: 80
+        - Id: !ImportValue WebFarm-Instance2
+          Port: 80
+        - Id: !ImportValue WebFarm-Instance3
+          Port: 80
+        - Id: !ImportValue WebFarm-Instance4
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: sampleEC2-TG
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+Outputs:
+  ALBDNSName:
+    Description: Open this URL in your browser to see load-balanced traffic
+    Value: !GetAtt WebALB.DNSName
